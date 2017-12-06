@@ -1,0 +1,20 @@
+{ pkgs ? import (fetchTarball "https://github.com/NixOS/nixpkgs/archive/17.09.tar.gz") {}
+}:
+pkgs.buildGoPackage rec {
+  name = "batbroker-${version}";
+  version = "dev";
+
+  goPackagePath = "gitlab.inria.fr/batsim/batbroker";
+
+  src = ./.;
+
+  goDeps = ./deps.nix;
+
+  LC_ALL = "C";
+
+  buildInputs = with pkgs; [
+    pkgconfig
+    go
+    zeromq
+  ];
+}
