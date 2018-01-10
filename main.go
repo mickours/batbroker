@@ -55,11 +55,12 @@ func recvBatsimMessage(socket *zmq.Socket) ([]byte, BatMessage) {
 		panic("Error while receiving Batsim message: " + err.Error())
 	}
 
+	// reset message structure
+	jmsg = BatMessage{}
+
 	if err := json.Unmarshal(msg, &jmsg); err != nil {
 		panic(err)
 	}
-
-	fmt.Println("Received message:\n", jmsg)
 	return msg, jmsg
 }
 
@@ -188,6 +189,7 @@ func main() {
 		bda_sock.SendBytes(msg, 0)
 		// get reply
 		_, bda_jmsg = recvBatsimMessage(bda_sock)
+		fmt.Println("Received message from BDA:\n", bda_jmsg)
 
 		fmt.Println("Forwarding Batsim events to HPC scheduler")
 		// merge HPC specific events and common events
@@ -198,6 +200,7 @@ func main() {
 		hpc_sock.SendBytes(msg, 0)
 		// get reply
 		_, hpc_jmsg = recvBatsimMessage(hpc_sock)
+		fmt.Println("Received message from HPC:\n", hpc_jmsg)
 
 		// Inspect HPC response
 		for _, event := range hpc_jmsg.Events {
@@ -217,6 +220,8 @@ func main() {
 		//
 		// BATSIM <--- BROCKER
 
+		// reset message structure
+		jmsg = BatMessage{}
 		// merge messages with ordered events
 		jmsg.Events = append(hpc_jmsg.Events, bda_jmsg.Events...)
 
