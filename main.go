@@ -1,13 +1,13 @@
 package main
 
 // this broker enables connection from batsim to on HPC and one Big Data
-// Analitics (BDA) schedulers like presented here:
+// Analytics (BDA) schedulers like presented here:
 //
 //                      /--- HPC
-// BATSIM --- BROCKER --
+// BATSIM --- BROKER --
 //                      \--- BDA
 //
-// Workload is splitted using the ``_hpc.json`` or ``_bda.json``suffix on
+// Workload is split using the ``_hpc.json`` or ``_bda.json``suffix on
 // the workload filename given to batsim.
 //
 // It also implements bebida prolog/epilog
@@ -22,6 +22,12 @@ import (
 	"strings"
 )
 
+// Declare this as global to use only two message buffer for the whole code
+var jmsg BatMessage
+var msg []byte
+var err error
+
+// Message from the Batsim protocole
 type BatMessage struct {
 	Now    float64 `json:"now"`
 	Events []Event `json:"events"`
@@ -33,6 +39,7 @@ type Event struct {
 	Data      map[string]interface{} `json:"data"`
 }
 
+// Helpers
 func is_bda_workload(workload_path string) bool {
 	return strings.HasSuffix(workload_path, "bda.json")
 }
@@ -41,16 +48,12 @@ func is_hpc_workload(workload_path string) bool {
 	return strings.HasSuffix(workload_path, "hpc.json")
 }
 
-var workload_id string
-
 func getWorkloadID(event Event) string {
 	return strings.Split(event.Data["job_id"].(string), "!")[0]
 }
 
-var jmsg BatMessage
-
 func recvBatsimMessage(socket *zmq.Socket) ([]byte, BatMessage) {
-	msg, err := socket.RecvBytes(0)
+	msg, err = socket.RecvBytes(0)
 	if err != nil {
 		panic("Error while receiving Batsim message: " + err.Error())
 	}
@@ -62,6 +65,67 @@ func recvBatsimMessage(socket *zmq.Socket) ([]byte, BatMessage) {
 		panic(err)
 	}
 	return msg, jmsg
+}
+
+// Implement Bebida
+//
+// prolog
+func runHPCJobProlog(now *float64, events []Event, bda_sock *zmq.Socket) {
+	// Inspect HPC response
+	for _, event := range events {
+		switch event.Type {
+		case "EXECUTE_JOB":
+			{
+				// Trigger HPC job prolog here
+				// Ask BDA to remove allocated resources
+
+				jmsg = BatMessage{
+					Now: *now,
+					Events: []Event{
+						Event{
+							Timestamp: *now,
+							Type:      "REMOVE_RESOURCES",
+							Data:      map[string]interface{}{"alloc": event.Data["alloc"]},
+						},
+					},
+				}
+				msg, err = json.Marshal(jmsg)
+				// send
+				bda_sock.SendBytes(msg, 0)
+				// Receive acknowledgement
+				_, jmsg = recvBatsimMessage(bda_sock)
+				// Modify HPC execute job message's timestamp
+				event.Timestamp = jmsg.Now
+				// Update simulation time
+				*now = jmsg.Now
+			}
+		}
+	}
+}
+
+// epilog
+func runHPCJobEpilog(now *float64, event Event, bda_sock *zmq.Socket) {
+	// Give back the allocated resources to BDA
+	jmsg = BatMessage{
+		Now: *now,
+		Events: []Event{
+			Event{
+				Timestamp: *now,
+				Type:      "ADD_RESOURCES",
+				Data:      map[string]interface{}{"alloc": event.Data["alloc"]},
+			},
+		},
+	}
+	msg, err = json.Marshal(jmsg)
+	// send
+	bda_sock.SendBytes(msg, 0)
+	// Receive acknowledgement
+	_, jmsg = recvBatsimMessage(bda_sock)
+
+	// Modify HPC execute job message's timestamp
+	event.Timestamp = jmsg.Now
+	// Update simulation time
+	*now = jmsg.Now
 }
 
 func main() {
@@ -83,9 +147,8 @@ func main() {
 	hpc_workload := "Not found"
 	bda_workload := "Not found"
 
-	var msg []byte
-	var bda_jmsg BatMessage
-	var hpc_jmsg BatMessage
+	var bda_reply BatMessage
+	var hpc_reply BatMessage
 	var bda_events []Event
 	var hpc_events []Event
 	var common_events []Event
@@ -100,8 +163,8 @@ func main() {
 		bda_events = []Event{}
 		common_events = []Event{}
 		jmsg = BatMessage{}
-		bda_jmsg = BatMessage{}
-		hpc_jmsg = BatMessage{}
+		bda_reply = BatMessage{}
+		hpc_reply = BatMessage{}
 
 		msg, err = bat_sock.RecvBytes(0)
 		if err != nil {
@@ -113,7 +176,7 @@ func main() {
 		}
 		fmt.Println("Received batsim message:\n", jmsg)
 
-		// BATSIM --> BROCKER
+		// BATSIM --> BROKER
 		now = jmsg.Now
 		for _, event := range jmsg.Events {
 			fmt.Println("BATSIM EVENT: ", event.Type)
@@ -136,7 +199,7 @@ func main() {
 			case "SIMULATION_BEGINS":
 				{
 					fmt.Println("Hello Batsim!")
-					// get workload/schdeduler mapping
+					// get workload/scheduler mapping
 					for id, path := range event.Data["workloads"].(map[string]interface{}) {
 						if is_hpc_workload(path.(string)) {
 							hpc_workload = id
@@ -155,7 +218,8 @@ func main() {
 					switch getWorkloadID(event) {
 					case hpc_workload:
 						{
-							// TODO manage HPC jobs epilog here
+							// manage HPC jobs epilog here
+							runHPCJobEpilog(&now, event, bda_sock)
 							hpc_events = append(hpc_events, event)
 						}
 					case bda_workload:
@@ -178,18 +242,8 @@ func main() {
 		// to sync time)
 		//
 		//            /--- HPC
-		// BROCKER --
+		// BROKER --
 		//            \--- BDA
-		fmt.Println("Forwarding Batsim events to BDA scheduler")
-		// merge BDA specific events and common events
-		bda_events = append(bda_events, common_events...)
-		// create the message
-		msg, err = json.Marshal(BatMessage{Now: now, Events: bda_events})
-		// send
-		bda_sock.SendBytes(msg, 0)
-		// get reply
-		_, bda_jmsg = recvBatsimMessage(bda_sock)
-		fmt.Println("Received message from BDA:\n", bda_jmsg)
 
 		fmt.Println("Forwarding Batsim events to HPC scheduler")
 		// merge HPC specific events and common events
@@ -199,34 +253,34 @@ func main() {
 		// send
 		hpc_sock.SendBytes(msg, 0)
 		// get reply
-		_, hpc_jmsg = recvBatsimMessage(hpc_sock)
-		fmt.Println("Received message from HPC:\n", hpc_jmsg)
+		_, hpc_reply = recvBatsimMessage(hpc_sock)
+		fmt.Println("Received message from HPC:\n", hpc_reply)
 
-		// Inspect HPC response
-		for _, event := range hpc_jmsg.Events {
-			switch event.Type {
-			case "EXECUTE_JOB":
-				{
-					// TODO manage HPC job prolog here
-				}
-			default:
-				{
-					fmt.Println("Not Handled HPC EVENT: ", event.Type)
-				}
-			}
-		}
+		// Run Bebida HPC job prolog
+		runHPCJobProlog(&now, hpc_reply.Events, bda_sock)
+
+		fmt.Println("Forwarding Batsim events to BDA scheduler")
+		// merge BDA specific events and common events
+		bda_events = append(bda_events, common_events...)
+		// create the message
+		msg, err = json.Marshal(BatMessage{Now: now, Events: bda_events})
+		// send
+		bda_sock.SendBytes(msg, 0)
+		// get reply
+		_, bda_reply = recvBatsimMessage(bda_sock)
+		fmt.Println("Received message from BDA:\n", bda_reply)
 
 		// Merge and forward message to batsim
 		//
-		// BATSIM <--- BROCKER
+		// BATSIM <--- BROKER
 
 		// reset message structure
 		jmsg = BatMessage{}
 		// merge messages with ordered events
-		jmsg.Events = append(hpc_jmsg.Events, bda_jmsg.Events...)
+		jmsg.Events = append(hpc_reply.Events, bda_reply.Events...)
 
 		// get higher timestamp
-		jmsg.Now = math.Max(bda_jmsg.Now, hpc_jmsg.Now)
+		jmsg.Now = math.Max(bda_reply.Now, hpc_reply.Now)
 
 		msg, err = json.Marshal(jmsg)
 		if err != nil {
