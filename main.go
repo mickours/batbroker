@@ -25,6 +25,8 @@ import (
 // Declare this as global to use only two message buffer for the whole code
 var jmsg BatMessage
 var msg []byte
+var hpc_reply_json []byte
+var bda_reply_json []byte
 var err error
 
 // Message from the Batsim protocole
@@ -48,6 +50,7 @@ func is_hpc_workload(workload_path string) bool {
 	return strings.HasSuffix(workload_path, "hpc.json")
 }
 
+// TODO make it works also for job_ids (list of ids)
 func getWorkloadID(event Event) string {
 	return strings.Split(event.Data["job_id"].(string), "!")[0]
 }
@@ -71,40 +74,12 @@ func recvBatsimMessage(socket *zmq.Socket) ([]byte, BatMessage) {
 //
 // prolog
 func runHPCJobProlog(now *float64, events []Event, bda_sock *zmq.Socket) {
-	// Inspect HPC response
-	for _, event := range events {
-		switch event.Type {
-		case "EXECUTE_JOB":
-			{
-				// Trigger HPC job prolog here
-				// Ask BDA to remove allocated resources
 
-				jmsg = BatMessage{
-					Now: *now,
-					Events: []Event{
-						Event{
-							Timestamp: *now,
-							Type:      "REMOVE_RESOURCES",
-							Data:      map[string]interface{}{"alloc": event.Data["alloc"]},
-						},
-					},
-				}
-				msg, err = json.Marshal(jmsg)
-				// send
-				bda_sock.SendBytes(msg, 0)
-				// Receive acknowledgement
-				_, jmsg = recvBatsimMessage(bda_sock)
-				// Modify HPC execute job message's timestamp
-				event.Timestamp = jmsg.Now
-				// Update simulation time
-				*now = jmsg.Now
-			}
-		}
-	}
 }
 
 // epilog
 func runHPCJobEpilog(now *float64, event Event, bda_sock *zmq.Socket) {
+	fmt.Println("Trigger HPC job epilog for resources: ", event.Data["alloc"])
 	// Give back the allocated resources to BDA
 	jmsg = BatMessage{
 		Now: *now,
@@ -112,7 +87,7 @@ func runHPCJobEpilog(now *float64, event Event, bda_sock *zmq.Socket) {
 			Event{
 				Timestamp: *now,
 				Type:      "ADD_RESOURCES",
-				Data:      map[string]interface{}{"alloc": event.Data["alloc"]},
+				Data:      map[string]interface{}{"resources": event.Data["alloc"]},
 			},
 		},
 	}
@@ -152,6 +127,7 @@ func main() {
 	var bda_events []Event
 	var hpc_events []Event
 	var common_events []Event
+	var blocked_hpc_event []Event
 	var now float64
 	var err error
 	this_is_the_end := false
@@ -174,14 +150,13 @@ func main() {
 		if err := json.Unmarshal(msg, &jmsg); err != nil {
 			panic(err)
 		}
-		fmt.Println("Received batsim message:\n", jmsg)
+		fmt.Println("Batsim -> Broker:\n", string(msg))
 
 		// BATSIM --> BROKER
 		now = jmsg.Now
 		for _, event := range jmsg.Events {
-			fmt.Println("BATSIM EVENT: ", event.Type)
 			switch event.Type {
-			case "JOB_SUBMITTED":
+			case "JOB_SUBMITTED", "JOB_KILLED":
 				{
 					// Split message events using workload id
 					switch getWorkloadID(event) {
@@ -245,30 +220,74 @@ func main() {
 		// BROKER --
 		//            \--- BDA
 
-		fmt.Println("Forwarding Batsim events to HPC scheduler")
 		// merge HPC specific events and common events
 		hpc_events = append(hpc_events, common_events...)
 		// create the message
 		msg, err = json.Marshal(BatMessage{Now: now, Events: hpc_events})
 		// send
 		hpc_sock.SendBytes(msg, 0)
+		fmt.Println("Broker -> HPC:\n", string(msg))
+
 		// get reply
-		_, hpc_reply = recvBatsimMessage(hpc_sock)
-		fmt.Println("Received message from HPC:\n", hpc_reply)
+		hpc_reply_json, hpc_reply = recvBatsimMessage(hpc_sock)
+		fmt.Println("Broker <= HPC:\n", string(hpc_reply_json))
 
-		// Run Bebida HPC job prolog
-		runHPCJobProlog(&now, hpc_reply.Events, bda_sock)
+		// Inspect HPC response
+		var to_remove_indexes []int
+		for index, event := range hpc_reply.Events {
+			switch event.Type {
+			case "EXECUTE_JOB":
+				{
+					// Trigger HPC job prolog here
+					// Run Bebida HPC job prolog
+					fmt.Println("Trigger HPC job prolog for resources: ", event.Data["alloc"])
+					// Ask BDA to remove allocated resources
+					new_event := Event{
+							Timestamp: hpc_reply.Now,
+							Type:      "REMOVE_RESOURCES",
+							Data:      map[string]interface{}{"resources": event.Data["alloc"]},
+					}
+					bda_events = append(bda_events, new_event)
+					blocked_hpc_event = append(blocked_hpc_event, event)
+					to_remove_indexes = append(to_remove_indexes, index)
+				}
+			}
+		}
+		// Hold events by removing them from events to forward
+		// Do a reverse range to avoid index error
+		last := len(to_remove_indexes)-1
+		for i := range to_remove_indexes {
+			reverse_i := to_remove_indexes[last - i]
+			hpc_reply.Events = append(
+				hpc_reply.Events[:reverse_i],
+				hpc_reply.Events[reverse_i+1:]...)
+		}
 
-		fmt.Println("Forwarding Batsim events to BDA scheduler")
 		// merge BDA specific events and common events
 		bda_events = append(bda_events, common_events...)
 		// create the message
 		msg, err = json.Marshal(BatMessage{Now: now, Events: bda_events})
 		// send
 		bda_sock.SendBytes(msg, 0)
+		fmt.Println("Broker -> BDA:\n", string(msg))
+
 		// get reply
-		_, bda_reply = recvBatsimMessage(bda_sock)
-		fmt.Println("Received message from BDA:\n", bda_reply)
+		bda_reply_json, bda_reply = recvBatsimMessage(bda_sock)
+		fmt.Println("Broker <= BDA:\n", string(bda_reply_json))
+
+		// Inspect BDA reply
+		for _, event := range bda_reply.Events {
+			switch event.Type {
+			case "RESOURCES_REMOVED":
+				{
+					// Now wait for Resource removed event from BDA to relase the message
+					// pop blocked event
+					event, blocked_hpc_event = blocked_hpc_event[0], blocked_hpc_event[1:]
+					// Add it to the reply
+					hpc_reply.Events = append(hpc_reply.Events, event)
+				}
+			}
+		}
 
 		// Merge and forward message to batsim
 		//
@@ -287,7 +306,8 @@ func main() {
 			panic("Error in message merging: " + err.Error())
 		}
 
-		fmt.Println("Forward message to Batsim:\n", jmsg)
 		bat_sock.SendBytes(msg, 0)
+		fmt.Println("Batsim <= Broker(HPC+BDA):\n", string(msg))
+		fmt.Println("------------------------------------------")
 	}
 }
