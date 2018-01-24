@@ -50,9 +50,8 @@ func is_hpc_workload(workload_path string) bool {
 	return strings.HasSuffix(workload_path, "hpc.json")
 }
 
-// TODO make it works also for job_ids (list of ids)
-func getWorkloadID(event Event) string {
-	return strings.Split(event.Data["job_id"].(string), "!")[0]
+func getWorkloadID(id string) string {
+	return strings.Split(id, "!")[0]
 }
 
 func recvBatsimMessage(socket *zmq.Socket) ([]byte, BatMessage) {
@@ -103,6 +102,18 @@ func runHPCJobEpilog(now *float64, event Event, bda_sock *zmq.Socket) {
 	*now = jmsg.Now
 }
 
+// Do a reverse range to avoid index error
+func removeEvents(to_remove_indexes []int, events *[]Event) {
+	last := len(to_remove_indexes)-1
+	for i := range to_remove_indexes {
+		reverse_i := to_remove_indexes[last - i]
+		(*events) = append(
+			(*events)[:reverse_i],
+			(*events)[reverse_i+1:]...
+		)
+	}
+}
+
 func main() {
 	bat_host := "127.0.0.1"
 	bat_port := "28000"
@@ -128,6 +139,7 @@ func main() {
 	var hpc_events []Event
 	var common_events []Event
 	var blocked_hpc_event []Event
+	var to_remove_indexes []int
 	var now float64
 	var err error
 	this_is_the_end := false
@@ -156,21 +168,6 @@ func main() {
 		now = jmsg.Now
 		for _, event := range jmsg.Events {
 			switch event.Type {
-			case "JOB_SUBMITTED", "JOB_KILLED":
-				{
-					// Split message events using workload id
-					switch getWorkloadID(event) {
-					case hpc_workload:
-						{
-							hpc_events = append(hpc_events, event)
-						}
-					case bda_workload:
-						{
-							bda_events = append(bda_events, event)
-						}
-					}
-
-				}
 			case "SIMULATION_BEGINS":
 				{
 					fmt.Println("Hello Batsim!")
@@ -187,10 +184,41 @@ func main() {
 					fmt.Println("BDA Workload id is: ", bda_workload)
 					common_events = append(common_events, event)
 				}
+			case "JOB_SUBMITTED":
+				{
+					// Split message events using workload id
+					switch getWorkloadID(event.Data["job_id"].(string)) {
+					case hpc_workload:
+						{
+							hpc_events = append(hpc_events, event)
+						}
+					case bda_workload:
+						{
+							bda_events = append(bda_events, event)
+						}
+					}
+
+				}
+			case "JOB_KILLED":
+				{
+					// Split message events using first job workload id
+					// FIXME check if all jobs are from the same workload
+					switch getWorkloadID(event.Data["job_ids"].([]interface{})[0].(string)) {
+					case hpc_workload:
+						{
+							hpc_events = append(hpc_events, event)
+						}
+					case bda_workload:
+						{
+							bda_events = append(bda_events, event)
+						}
+					}
+
+				}
 			case "JOB_COMPLETED":
 				{
 					// Split message events using workload id
-					switch getWorkloadID(event) {
+					switch getWorkloadID(event.Data["job_id"].(string)) {
 					case hpc_workload:
 						{
 							// manage HPC jobs epilog here
@@ -233,7 +261,7 @@ func main() {
 		fmt.Println("Broker <= HPC:\n", string(hpc_reply_json))
 
 		// Inspect HPC response
-		var to_remove_indexes []int
+		to_remove_indexes = []int{}
 		for index, event := range hpc_reply.Events {
 			switch event.Type {
 			case "EXECUTE_JOB":
@@ -243,9 +271,9 @@ func main() {
 					fmt.Println("Trigger HPC job prolog for resources: ", event.Data["alloc"])
 					// Ask BDA to remove allocated resources
 					new_event := Event{
-							Timestamp: hpc_reply.Now,
-							Type:      "REMOVE_RESOURCES",
-							Data:      map[string]interface{}{"resources": event.Data["alloc"]},
+						Timestamp: hpc_reply.Now,
+						Type:      "REMOVE_RESOURCES",
+						Data:      map[string]interface{}{"resources": event.Data["alloc"]},
 					}
 					bda_events = append(bda_events, new_event)
 					blocked_hpc_event = append(blocked_hpc_event, event)
@@ -254,14 +282,7 @@ func main() {
 			}
 		}
 		// Hold events by removing them from events to forward
-		// Do a reverse range to avoid index error
-		last := len(to_remove_indexes)-1
-		for i := range to_remove_indexes {
-			reverse_i := to_remove_indexes[last - i]
-			hpc_reply.Events = append(
-				hpc_reply.Events[:reverse_i],
-				hpc_reply.Events[reverse_i+1:]...)
-		}
+		removeEvents(to_remove_indexes, &hpc_reply.Events)
 
 		// merge BDA specific events and common events
 		bda_events = append(bda_events, common_events...)
@@ -276,18 +297,29 @@ func main() {
 		fmt.Println("Broker <= BDA:\n", string(bda_reply_json))
 
 		// Inspect BDA reply
-		for _, event := range bda_reply.Events {
+		to_remove_indexes = []int{}
+		for index, event := range bda_reply.Events {
 			switch event.Type {
 			case "RESOURCES_REMOVED":
 				{
 					// Now wait for Resource removed event from BDA to relase the message
 					// pop blocked event
-					event, blocked_hpc_event = blocked_hpc_event[0], blocked_hpc_event[1:]
+					var to_add_event Event
+					to_add_event, blocked_hpc_event = blocked_hpc_event[0], blocked_hpc_event[1:]
+					// check that the removed resources are the same that are
+					// allocated by the HPC job
+					if to_add_event.Data["alloc"] != event.Data["resources"] {
+						panic("Error in prolog ordering!!!")
+					}
 					// Add it to the reply
-					hpc_reply.Events = append(hpc_reply.Events, event)
+					hpc_reply.Events = append(hpc_reply.Events, to_add_event)
+					// remove this event from BDA events
+					to_remove_indexes = append(to_remove_indexes, index)
 				}
 			}
 		}
+		// Prevent Batsim to receive RESOURCES_REMOVED message
+		removeEvents(to_remove_indexes, &bda_reply.Events)
 
 		// Merge and forward message to batsim
 		//
