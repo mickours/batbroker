@@ -69,41 +69,8 @@ func recvBatsimMessage(socket *zmq.Socket) ([]byte, BatMessage) {
 	return msg, jmsg
 }
 
-// Implement Bebida
-//
-// prolog
-func runHPCJobProlog(now *float64, events []Event, bda_sock *zmq.Socket) {
-
-}
-
-// epilog
-func runHPCJobEpilog(now *float64, event Event, bda_sock *zmq.Socket) {
-	fmt.Println("Trigger HPC job epilog for resources: ", event.Data["alloc"])
-	// Give back the allocated resources to BDA
-	jmsg = BatMessage{
-		Now: *now,
-		Events: []Event{
-			Event{
-				Timestamp: *now,
-				Type:      "ADD_RESOURCES",
-				Data:      map[string]interface{}{"resources": event.Data["alloc"]},
-			},
-		},
-	}
-	msg, err = json.Marshal(jmsg)
-	// send
-	bda_sock.SendBytes(msg, 0)
-	// Receive acknowledgement
-	_, jmsg = recvBatsimMessage(bda_sock)
-
-	// Modify HPC execute job message's timestamp
-	event.Timestamp = jmsg.Now
-	// Update simulation time
-	*now = jmsg.Now
-}
-
-// Do a reverse range to avoid index error
 func removeEvents(to_remove_indexes []int, events *[]Event) {
+	// Do a reverse range to avoid index error
 	last := len(to_remove_indexes)-1
 	for i := range to_remove_indexes {
 		reverse_i := to_remove_indexes[last - i]
@@ -165,6 +132,7 @@ func main() {
 		fmt.Println("Batsim -> Broker:\n", string(msg))
 
 		// BATSIM --> BROKER
+		// Inspect Batsim request
 		now = jmsg.Now
 		for _, event := range jmsg.Events {
 			switch event.Type {
@@ -222,8 +190,14 @@ func main() {
 					case hpc_workload:
 						{
 							// manage HPC jobs epilog here
-							runHPCJobEpilog(&now, event, bda_sock)
-							hpc_events = append(hpc_events, event)
+							fmt.Println("Trigger HPC job epilog for resources: ", event.Data["alloc"])
+							// Give back the allocated resources to BDA
+							new_event := Event{
+										Timestamp: now,
+										Type:      "ADD_RESOURCES",
+										Data:      map[string]interface{}{"resources": event.Data["alloc"]},
+							}
+							bda_events = append(bda_events, new_event)
 						}
 					case bda_workload:
 						{
