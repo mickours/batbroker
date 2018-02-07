@@ -105,11 +105,13 @@ func main() {
 	var bda_events []Event
 	var hpc_events []Event
 	var common_events []Event
-	var blocked_hpc_event []Event
+	var prolog_blocked_hpc_events []Event
+	// var epilog_blocked_hpc_events []Event
 	var to_remove_indexes []int
 	var now float64
 	var err error
 	this_is_the_end := false
+	resumited_bda_workload := "resubmit"
 
 	// main loop
 	for !this_is_the_end {
@@ -160,10 +162,13 @@ func main() {
 						{
 							hpc_events = append(hpc_events, event)
 						}
-					case bda_workload:
+					// WARN Dynamically submitted jobs are always given to BDA
+					case bda_workload, resumited_bda_workload:
 						{
 							bda_events = append(bda_events, event)
 						}
+					default:
+						panic("This event should go somewhere!")
 					}
 
 				}
@@ -176,7 +181,7 @@ func main() {
 						{
 							hpc_events = append(hpc_events, event)
 						}
-					case bda_workload:
+					case bda_workload, resumited_bda_workload:
 						{
 							bda_events = append(bda_events, event)
 						}
@@ -198,8 +203,13 @@ func main() {
 										Data:      map[string]interface{}{"resources": event.Data["alloc"]},
 							}
 							bda_events = append(bda_events, new_event)
+							// wait for the resources to be added to the BDA resource
+							// pool before notifiing the HPC scheduler that the job is
+							// complete
+							//epilog_blocked_hpc_events = append(epilog_blocked_hpc_events, event)
+							hpc_events = append(hpc_events, event)
 						}
-					case bda_workload:
+					case bda_workload, resumited_bda_workload:
 						{
 							bda_events = append(bda_events, event)
 						}
@@ -250,7 +260,7 @@ func main() {
 						Data:      map[string]interface{}{"resources": event.Data["alloc"]},
 					}
 					bda_events = append(bda_events, new_event)
-					blocked_hpc_event = append(blocked_hpc_event, event)
+					prolog_blocked_hpc_events = append(prolog_blocked_hpc_events, event)
 					to_remove_indexes = append(to_remove_indexes, index)
 				}
 			}
@@ -276,10 +286,10 @@ func main() {
 			switch event.Type {
 			case "RESOURCES_REMOVED":
 				{
-					// Now wait for Resource removed event from BDA to relase the message
+					// End of prolog: Resource removed event from BDA so release the message
 					// pop blocked event
 					var to_add_event Event
-					to_add_event, blocked_hpc_event = blocked_hpc_event[0], blocked_hpc_event[1:]
+					to_add_event, prolog_blocked_hpc_events = prolog_blocked_hpc_events[0], prolog_blocked_hpc_events[1:]
 					// check that the removed resources are the same that are
 					// allocated by the HPC job
 					if to_add_event.Data["alloc"] != event.Data["resources"] {
@@ -290,6 +300,22 @@ func main() {
 					// remove this event from BDA events
 					to_remove_indexes = append(to_remove_indexes, index)
 				}
+			//case "RESOURCES_ADDED":
+			//	{
+			//		// End of epilog: Resource Added event from BDA so release the message
+			//		// pop blocked event
+			//		var to_add_event Event
+			//		to_add_event, epilog_blocked_hpc_events = epilog_blocked_hpc_events[0], epilog_blocked_hpc_events[1:]
+			//		// check that the removed resources are the same that are
+			//		// allocated by the HPC job
+			//		if to_add_event.Data["alloc"] != event.Data["resources"] {
+			//			panic("Error in epilog ordering!!!")
+			//		}
+			//		// Add it to the reply
+			//		hpc_reply.Events = append(hpc_reply.Events, to_add_event)
+			//		// remove this event from BDA events
+			//		to_remove_indexes = append(to_remove_indexes, index)
+			//	}
 			}
 		}
 		// Prevent Batsim to receive RESOURCES_REMOVED message
