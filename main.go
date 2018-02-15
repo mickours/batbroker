@@ -105,13 +105,13 @@ func main() {
 	var bda_events []Event
 	var hpc_events []Event
 	var common_events []Event
-	var prolog_blocked_hpc_events []Event
 	// var epilog_blocked_hpc_events []Event
 	var to_remove_indexes []int
 	var now float64
 	var err error
 	this_is_the_end := false
 	resumited_bda_workload := "resubmit"
+	prolog_blocked_hpc_events := map[string]Event{}
 
 	// main loop
 	for !this_is_the_end {
@@ -260,7 +260,7 @@ func main() {
 						Data:      map[string]interface{}{"resources": event.Data["alloc"]},
 					}
 					bda_events = append(bda_events, new_event)
-					prolog_blocked_hpc_events = append(prolog_blocked_hpc_events, event)
+					prolog_blocked_hpc_events[event.Data["alloc"].(string)] = event
 					to_remove_indexes = append(to_remove_indexes, index)
 				}
 			}
@@ -287,18 +287,22 @@ func main() {
 			case "RESOURCES_REMOVED":
 				{
 					// End of prolog: Resource removed event from BDA so release the message
-					// pop blocked event
-					var to_add_event Event
-					to_add_event, prolog_blocked_hpc_events = prolog_blocked_hpc_events[0], prolog_blocked_hpc_events[1:]
+					// get blocked event from allocation
+					to_add_event := prolog_blocked_hpc_events[event.Data["resources"].(string)]
+					if to_add_event.Data["alloc"] == nil {
+						panic(fmt.Sprintf("Error in prolog: The resource removed ack (%s) seems to be already acknowledged", event.Data["resources"]))
+					}
 					// check that the removed resources are the same that are
 					// allocated by the HPC job
 					if to_add_event.Data["alloc"] != event.Data["resources"] {
-						panic("Error in prolog ordering!!!")
+						panic(fmt.Sprintf("Error in prolog: The resource removed ack (%s) do not match blocked event resources %s", event.Data["resources"], to_add_event.Data["alloc"]))
 					}
 					// Add it to the reply
 					hpc_reply.Events = append(hpc_reply.Events, to_add_event)
 					// remove this event from BDA events
 					to_remove_indexes = append(to_remove_indexes, index)
+					// remove the blocked event from the map
+					delete(prolog_blocked_hpc_events, event.Data["resources"].(string))
 				}
 			//case "RESOURCES_ADDED":
 			//	{
@@ -340,6 +344,10 @@ func main() {
 
 		bat_sock.SendBytes(msg, 0)
 		fmt.Println("Batsim <= Broker(HPC+BDA):\n", string(msg))
+		fmt.Println("------------------------------------------")
+		fmt.Println("Blocked HPC events:");
+		blocked_events, _ := json.Marshal(prolog_blocked_hpc_events)
+		fmt.Println(string(blocked_events));
 		fmt.Println("------------------------------------------")
 	}
 }
